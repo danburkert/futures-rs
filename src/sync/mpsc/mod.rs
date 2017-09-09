@@ -476,6 +476,30 @@ impl<T> Sender<T> {
         Ok(self.poll_unparked())
     }
 
+    /// Returns a future which will complete when the channel is guaranteed to have capacity to
+    /// send at least one item without waiting.
+    ///
+    /// The returned future will resolve to an error if the receiver is dropped.
+    ///
+    /// Note: the `Ready` future is only valid until the next item is sent using this `Sender`.
+    /// Sending an item on the channel immediately after calling `ready` without waiting for the
+    /// returned future to complete may cause the future to erroneously indicate there is capacity
+    /// available.
+    pub fn ready(&mut self) -> Ready<T> {
+        let state = decode_state(self.inner.state.load(SeqCst));
+        if !state.is_open {
+            return Ready { inner: ReadyInner::Dropped }
+        }
+
+        if self.maybe_parked {
+            return Ready {
+                inner: ReadyInner::MaybeParked(self.inner.clone(), self.sender_task.clone()),
+            }
+        } else {
+            return Ready { inner: ReadyInner::Unparked }
+        }
+    }
+
     fn poll_unparked(&mut self) -> Async<()> {
         // First check the `maybe_parked` variable. This avoids acquiring the
         // lock in most cases
@@ -526,6 +550,67 @@ impl<T> Sink for Sender<T> {
 
     fn close(&mut self) -> Poll<(), SendError<T>> {
         Ok(Async::Ready(()))
+    }
+}
+
+/// The return type of `Sender::ready()`.
+///
+/// A future which completes when the sender is guaranteed to have capacity to send at least one
+/// item.
+pub struct Ready<T> {
+    inner: ReadyInner<T>,
+}
+
+/// An optimization for `Ready` which allows the expensive ready checks to be short circuited
+/// based on the `Sender`'s `maybe_ready` field.
+enum ReadyInner<T> {
+    /// The sender is unparked.
+    Unparked,
+    /// The receiver has been dropped.
+    Dropped,
+    /// The sender may be parked.
+    MaybeParked(Arc<Inner<T>>, SenderTask),
+}
+
+impl <T> Future for Ready<T> {
+    type Item = ();
+    type Error = ();
+    fn poll(&mut self) -> Poll<(), ()> {
+        match self.inner {
+            ReadyInner::Unparked => Ok(Async::Ready(())),
+            ReadyInner::Dropped => Err(()),
+            ReadyInner::MaybeParked(ref mut inner, ref mut sender_task) => {
+                // Check if the receiver has been dropped.
+                let state = decode_state(inner.state.load(SeqCst));
+                if !state.is_open {
+                    return Err(());
+                }
+
+                // Get a lock on the task handle
+                let mut task = sender_task.lock().unwrap();
+
+                if task.is_none() {
+                    return Ok(Async::Ready(()))
+                }
+
+                // At this point, an unpark request is pending, so there will be an
+                // unpark sometime in the future. We just need to make sure that
+                // the correct task will be notified.
+                //
+                // Update the task in case the `Sender` has been moved to another
+                // task
+                *task = Some(task::current());
+
+                Ok(Async::NotReady)
+            }
+        }
+    }
+}
+
+impl <T> fmt::Debug for Ready<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Ready")
+         .finish()
     }
 }
 
@@ -591,7 +676,6 @@ impl<T> Clone for UnboundedSender<T> {
         UnboundedSender(self.0.clone())
     }
 }
-
 
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Sender<T> {

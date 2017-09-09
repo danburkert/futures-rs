@@ -1,5 +1,6 @@
 #![cfg(feature = "use_std")]
 
+#[macro_use]
 extern crate futures;
 
 use futures::prelude::*;
@@ -351,6 +352,70 @@ fn stress_close_receiver() {
     for _ in 0..10000 {
         stress_close_receiver_iter();
     }
+}
+
+/// Tests that after `Ready` completes, a channel always has capacity to send.
+#[test]
+fn stress_ready() {
+    // A task which checks channel capcity using Sender::ready, and pushes items onto the channel
+    // when ready.
+    struct SenderTask {
+        count: u32,
+        sender: mpsc::Sender<u32>,
+        ready: mpsc::Ready<u32>,
+    }
+    impl Future for SenderTask {
+        type Item = ();
+        type Error = ();
+        fn poll(&mut self) -> Poll<(), ()> {
+            // In a loop, check if the ready future is complete. If so, push an item onto the
+            // channel (asserting that it didn't attempt to block), and replace the ready future.
+            while self.count > 0 {
+                try_ready!(self.ready.poll());
+                assert!(self.sender.start_send(self.count).unwrap().is_ready());
+                self.ready = self.sender.ready();
+                self.count -= 1;
+            }
+            Ok(Async::Ready(()))
+        }
+    }
+
+    const AMT: u32 = 1000;
+    const NTHREADS: u32 = 8;
+
+    /// Run a stress test using the specified channel capacity.
+    fn stress(capacity: usize) {
+        let (tx, rx) = mpsc::channel(capacity);
+        let mut threads = Vec::new();
+        for _ in 0..NTHREADS {
+            let mut sender = tx.clone();
+            threads.push(thread::spawn(move || {
+                let ready = sender.ready();
+                SenderTask {
+                    count: AMT,
+                    sender,
+                    ready,
+                }.wait()
+            }));
+        }
+        drop(tx);
+
+        let mut rx = rx.wait();
+        for _ in 0..AMT * NTHREADS {
+            assert!(rx.next().is_some());
+        }
+
+        assert!(rx.next().is_none());
+
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+    }
+
+    stress(0);
+    stress(1);
+    stress(8);
+    stress(16);
 }
 
 fn is_ready<T>(res: &AsyncSink<T>) -> bool {
